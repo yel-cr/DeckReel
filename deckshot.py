@@ -678,29 +678,29 @@ body{display:flex;flex-direction:column;padding-bottom:26px;}
       <button class="act-btn outline" onclick="closeSettings()" style="font-size:9px;padding:5px 12px;">CLOSE</button>
     </div>
     <div class="field">
-      <label>Steam userdata パス</label>
+      <label>Steam userdataパス</label>
       <input id="cfgSteamPath">
-      <div class="hint">Steam のスクリーンショットが保存されているディレクトリ</div>
+      <div class="hint">Steamのスクリーンショットが保存されているディレクトリ</div>
     </div>
     <div class="field">
-      <label>Steam ユーザー ID</label>
+      <label>SteamユーザーID</label>
       <select id="cfgUserId"></select>
-      <div class="hint">自動検出されます。複数ある場合は選択してください。</div>
+      <div class="hint">自動検出　複数ある場合は選択してください</div>
     </div>
     <div class="field">
-      <label>rclone パス</label>
+      <label>rcloneパス</label>
       <input id="cfgRclonePath">
-      <div class="hint">rclone バイナリのパス（例: ~/Desktop/Tools/rclone）</div>
+      <div class="hint">rcloneバイナリのパス</div>
     </div>
     <div class="field">
-      <label>ドライブ リモート名</label>
+      <label>リモート名</label>
       <input id="cfgRemote">
-      <div class="hint">rclone config で設定したリモート名</div>
+      <div class="hint">rclone configで設定したリモート名</div>
     </div>
     <div class="field">
-      <label>ドライブ 保存先フォルダ</label>
+      <label>保存先フォルダ</label>
       <input id="cfgBasePath">
-      <div class="hint">アップロード先: リモート名:フォルダ/ゲーム名/</div>
+      <div class="hint">アップロード先 → リモート名:保存先フォルダ/ゲーム名/</div>
     </div>
     <div class="modal-actions">
       <button class="act-btn outline" onclick="closeSettings()">キャンセル</button>
@@ -714,7 +714,7 @@ body{display:flex;flex-direction:column;padding-bottom:26px;}
   <div class="modal" style="width:360px;padding:36px;">
     <div class="exit-modal-inner">
       <div class="ex-title">EXIT?</div>
-      <div class="ex-sub">DeckShot を終了します</div>
+      <div class="ex-sub">DeckShotを終了します</div>
       <div class="ex-btns">
         <button class="act-btn outline" onclick="closeExitModal()">キャンセル</button>
         <button class="act-btn solid"   onclick="doExit()">終了する</button>
