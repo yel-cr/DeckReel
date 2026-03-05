@@ -783,7 +783,7 @@ body{display:flex;flex-direction:column;padding-bottom:26px;}
         <option value="8">8</option>
         <option value="16">16</option>
       </select>
-      <div class="hint">rcloneの並列転送数。回線が安定していれば8〜16に上げると高速化します</div>
+      <div class="hint">rcloneの並列転送数</div>
     </div>
     <div class="modal-actions">
       <button class="act-btn outline" onclick="closeSettings()">キャンセル</button>
