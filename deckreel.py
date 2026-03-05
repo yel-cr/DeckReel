@@ -17,6 +17,7 @@ import os
 import json
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -35,7 +36,7 @@ from urllib.parse import urlparse, parse_qs
 # ═══════════════════════════════════════════════════════════════════
 
 APP_NAME = "DeckReel"
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.5.0"
 HOST = "127.0.0.1"
 PORT = 8745
 CONFIG_DIR = Path.home() / ".config" / "deckreel"
@@ -64,6 +65,7 @@ class Config:
         "rclone_path": "rclone",
         "drive_remote": "gdrive",
         "drive_base_path": "Screenshots",
+        "transfers": "4",
     }
 
     def __init__(self):
@@ -264,7 +266,7 @@ class SteamScanner:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Sync Engine
+#  Sync Engine  (v1.5 — ゲーム単位バッチ転送 + 並列転送)
 # ═══════════════════════════════════════════════════════════════════
 
 class SyncEngine:
@@ -299,46 +301,102 @@ class SyncEngine:
         return name.strip(". ")
 
     def sync(self, file_list):
-        # Fix 4: 多重起動防止チェック
+        """ゲーム単位でまとめて rclone copy し、--files-from と
+        --transfers で並列転送することで大幅に高速化する。"""
+        # 多重起動防止チェック
         with self._lock:
             if self._status["running"]:
                 return
         self._cancel = False
+
+        # ── ファイルを (転送元ディレクトリ, ゲーム名) でグループ化 ──
+        groups = {}  # key: (src_dir, safe_name, game_name)  value: [filepath, ...]
+        for fpath, game_name in file_list:
+            src_dir = str(Path(fpath).parent)
+            safe = self._safe_name(game_name)
+            key = (src_dir, safe, game_name)
+            groups.setdefault(key, []).append(fpath)
+
+        total_files = len(file_list)
         self._update(
-            running=True, current=0, total=len(file_list),
+            running=True, current=0, total=total_files,
             filename="", uploaded=0, errors=0, error_messages=[],
         )
+
         rclone = self.config.get("rclone_path")
         remote = self.config.get("drive_remote")
         base = self.config.get("drive_base_path")
+        transfers = self.config.get("transfers") or "4"
+        done = 0
 
-        for i, (fpath, game_name) in enumerate(file_list):
+        for (src_dir, safe, game_name), files in groups.items():
             if self._cancel:
                 break
-            fname = Path(fpath).name
-            self._update(current=i + 1, filename=fname)
-            safe = self._safe_name(game_name)
+
+            count = len(files)
+            self._update(
+                current=done,
+                filename=f"{game_name}\uff08{count}\u679a\uff09",
+            )
+
             dest = f"{remote}:{base}/{safe}"
+            tf_path = None
+
             try:
+                # ── ファイル名リストを一時ファイルに書き出す ──
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".txt", delete=False
+                ) as tf:
+                    for fp in files:
+                        tf.write(Path(fp).name + "\n")
+                    tf_path = tf.name
+
+                # ── rclone copy をフォルダ単位で実行 ──
+                #   --files-from : 対象ファイルを限定
+                #   --transfers  : 並列転送数
+                #   --checkers   : 並列チェック数
+                timeout = max(180, count * 30)
                 r = subprocess.run(
-                    [rclone, "copy", fpath, dest],
-                    capture_output=True, text=True, timeout=120,
+                    [
+                        rclone, "copy",
+                        src_dir, dest,
+                        "--files-from", tf_path,
+                        "--transfers", str(transfers),
+                        "--checkers", "8",
+                    ],
+                    capture_output=True, text=True, timeout=timeout,
                 )
+
                 if r.returncode == 0:
-                    dp = f"{dest}/{fname}"
-                    self.tracker.mark_uploaded(fpath, dp)
+                    # 成功 → 全ファイルをアップロード済みとして記録
+                    for fp in files:
+                        fname = Path(fp).name
+                        self.tracker.mark_uploaded(fp, f"{dest}/{fname}")
                     with self._lock:
-                        self._status["uploaded"] += 1
+                        self._status["uploaded"] += count
                 else:
                     with self._lock:
-                        self._status["errors"] += 1
+                        self._status["errors"] += count
                         self._status["error_messages"].append(
-                            f"{fname}: {r.stderr.strip()[:200]}"
+                            f"{game_name}: {r.stderr.strip()[:200]}"
                         )
+
             except Exception as e:
                 with self._lock:
-                    self._status["errors"] += 1
-                    self._status["error_messages"].append(f"{fname}: {str(e)[:200]}")
+                    self._status["errors"] += count
+                    self._status["error_messages"].append(
+                        f"{game_name}: {str(e)[:200]}"
+                    )
+            finally:
+                # 一時ファイルの後片付け
+                if tf_path:
+                    try:
+                        os.unlink(tf_path)
+                    except OSError:
+                        pass
+
+            done += count
+            self._update(current=done)
 
         self._update(running=False)
 
@@ -702,6 +760,16 @@ body{display:flex;flex-direction:column;padding-bottom:26px;}
       <input id="cfgBasePath">
       <div class="hint">アップロード先 → リモート名:保存先フォルダ/ゲーム名/</div>
     </div>
+    <div class="field">
+      <label>同時転送数</label>
+      <select id="cfgTransfers">
+        <option value="2">2</option>
+        <option value="4" selected>4</option>
+        <option value="8">8</option>
+        <option value="16">16</option>
+      </select>
+      <div class="hint">rcloneの並列転送数</div>
+    </div>
     <div class="modal-actions">
       <button class="act-btn outline" onclick="closeSettings()">キャンセル</button>
       <button class="act-btn solid"   onclick="saveSettings()">保存</button>
@@ -961,6 +1029,9 @@ async function openSettings(){
   document.getElementById('cfgRclonePath').value=d.rclone_path||'';
   document.getElementById('cfgRemote').value=d.drive_remote||'';
   document.getElementById('cfgBasePath').value=d.drive_base_path||'';
+  const tSel=document.getElementById('cfgTransfers');
+  const tVal=d.transfers||'4';
+  for(let i=0;i<tSel.options.length;i++){tSel.options[i].selected=(tSel.options[i].value===tVal);}
   const sel=document.getElementById('cfgUserId');sel.innerHTML='';
   for(const uid of(d._user_ids||[])){const o=document.createElement('option');o.value=uid;o.textContent=uid;if(uid===d.steam_user_id)o.selected=true;sel.appendChild(o);}
   if(sel.options.length===0&&d.steam_user_id){const o=document.createElement('option');o.value=d.steam_user_id;o.textContent=d.steam_user_id;o.selected=true;sel.appendChild(o);}
@@ -974,6 +1045,7 @@ async function saveSettings(){
     rclone_path:document.getElementById('cfgRclonePath').value,
     drive_remote:document.getElementById('cfgRemote').value,
     drive_base_path:document.getElementById('cfgBasePath').value,
+    transfers:document.getElementById('cfgTransfers').value,
   })});
   closeSettings();
   toast('設定を保存しました','success');
