@@ -157,13 +157,7 @@ class GameResolver:
                     time.sleep(1.0)
         return None
 
-    def resolve_batch(self, app_ids):
-        results = {}
-        for i, aid in enumerate(app_ids):
-            name = self.resolve(aid)
-            results[aid] = name
-            time.sleep(0.35)
-        return results
+
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -367,18 +361,39 @@ class SyncEngine:
                     capture_output=True, text=True, timeout=timeout,
                 )
 
-                if r.returncode == 0:
-                    # 成功 → 全ファイルをアップロード済みとして記録
-                    for fp in files:
-                        fname = Path(fp).name
+                # ── リモート側のファイル一覧を取得して実際の成否を判定 ──
+                # rclone が部分的に失敗した場合でも、成功分は記録する
+                remote_files = set()
+                try:
+                    ls = subprocess.run(
+                        [rclone, "lsf", dest],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if ls.returncode == 0:
+                        remote_files = set(
+                            line.strip() for line in ls.stdout.splitlines()
+                            if line.strip()
+                        )
+                except Exception:
+                    pass  # lsf失敗時は空セットのまま → 全ファイル未確認扱い
+
+                ok = 0
+                ng = 0
+                for fp in files:
+                    fname = Path(fp).name
+                    if fname in remote_files:
                         self.tracker.mark_uploaded(fp, f"{dest}/{fname}")
-                    with self._lock:
-                        self._status["uploaded"] += count
-                else:
-                    with self._lock:
-                        self._status["errors"] += count
+                        ok += 1
+                    else:
+                        ng += 1
+
+                with self._lock:
+                    self._status["uploaded"] += ok
+                    if ng > 0:
+                        self._status["errors"] += ng
+                        err_detail = r.stderr.strip()[:200] if r.stderr else "一部ファイルの転送に失敗"
                         self._status["error_messages"].append(
-                            f"{game_name}: {r.stderr.strip()[:200]}"
+                            f"{game_name}: {ng}件失敗 — {err_detail}"
                         )
 
             except Exception as e:
@@ -768,7 +783,7 @@ body{display:flex;flex-direction:column;padding-bottom:26px;}
         <option value="8">8</option>
         <option value="16">16</option>
       </select>
-      <div class="hint">rcloneの並列転送数</div>
+      <div class="hint">rcloneの並列転送数。回線が安定していれば8〜16に上げると高速化します</div>
     </div>
     <div class="modal-actions">
       <button class="act-btn outline" onclick="closeSettings()">キャンセル</button>
