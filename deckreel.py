@@ -15,6 +15,7 @@ DeckReel - Steam Deck スクリーンショット マネージャー
 
 import os
 import json
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -36,7 +37,7 @@ from urllib.parse import urlparse, parse_qs
 # ═══════════════════════════════════════════════════════════════════
 
 APP_NAME = "DeckReel"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 HOST = "127.0.0.1"
 PORT = 8745
 CONFIG_DIR = Path.home() / ".config" / "deckreel"
@@ -46,7 +47,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_STEAM_PATH = Path.home() / ".local" / "share" / "Steam" / "userdata"
 STEAM_API_URL = "https://store.steampowered.com/api/appdetails?appids={}&l=japanese"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
-HEARTBEAT_TIMEOUT = 60  # seconds without browser heartbeat before auto-shutdown
+HEARTBEAT_TIMEOUT = 10  # seconds without browser heartbeat before auto-shutdown
+PID_FILE = CONFIG_DIR / "deckreel.pid"
 
 # Well-known non-game App IDs
 KNOWN_APP_IDS = {
@@ -142,7 +144,7 @@ class GameResolver:
         for attempt in range(3):
             try:
                 url = STEAM_API_URL.format(app_id)
-                req = urllib.request.Request(url, headers={"User-Agent": "DeckReel/1.3"})
+                req = urllib.request.Request(url, headers={"User-Agent": f"DeckReel/{APP_VERSION}"})
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 if data.get(app_id, {}).get("success"):
@@ -1057,15 +1059,13 @@ async function saveSettings(){
 function openExitModal(){document.getElementById('exitModal').classList.add('open');}
 function closeExitModal(){document.getElementById('exitModal').classList.remove('open');}
 async function doExit(){
-  // まずウィンドウを閉じ、その後サーバーをシャットダウンする
-  // window.close() はスクリプトで開いたタブのみ有効なため、
-  // フォールバックとして空ページへ遷移して再アクセスできないようにする
-  try{ fetch('/api/exit',{method:'POST',keepalive:true}).catch(()=>{}); }catch(e){}
-  setTimeout(()=>{
-    try{ window.close(); }catch(e){}
-    // ブラウザが window.close() を拒否した場合はブランクページへ
-    setTimeout(()=>{ window.location.href='about:blank'; },400);
-  },150);
+  // 同期XHRでサーバーに確実にリクエストを届ける（ページ遷移しない）。
+  // サーバー終了 → Pythonプロセス終了 → Steamが自動的にホームへ戻る。
+  const xhr=new XMLHttpRequest();
+  xhr.open('GET','/api/exit',false);
+  try{xhr.send();}catch(e){}
+  // CEFが window.close() に対応している場合のフォールバック
+  try{window.close();}catch(e){}
 }
 
 // ── Ticker ──
@@ -1178,6 +1178,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         elif path == "/api/heartbeat":
             type(self).touch_heartbeat()
             self._json({"ok": True})
+        elif path == "/api/exit":
+            self._handle_exit()
         else:
             self._error(404, "Not found")
 
@@ -1202,7 +1204,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
             self._error(404, "Not found")
 
     def _handle_exit(self):
-        """EXITボタン: レスポンスを返してからサーバーをシャットダウンする"""
+        """EXITボタン: レスポンスを返してからサーバーをシャットダウンする。
+        同期XHRで呼ばれるため、レスポンス完了＝リクエスト到達が保証される。"""
         self._json({"ok": True})
         def _shutdown():
             time.sleep(0.3)
@@ -1394,7 +1397,39 @@ def main():
     DeckReelHandler.scanner = scanner
     DeckReelHandler.sync_engine = sync_engine
 
-    # Fix 2: 起動時にrcloneの存在を確認し、見つからなければ警告を表示
+    # ── 前回の残存プロセスを確実に終了する ──
+    def _kill_old_process():
+        if not PID_FILE.exists():
+            return
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            if old_pid == os.getpid():
+                return
+            # まず SIGTERM で丁寧に終了を要求
+            os.kill(old_pid, signal.SIGTERM)
+            for _ in range(30):  # 最大3秒待つ
+                time.sleep(0.1)
+                try:
+                    os.kill(old_pid, 0)
+                except ProcessLookupError:
+                    print(f"  前回のプロセス (PID {old_pid}) を終了しました")
+                    return
+            # まだ生きていれば強制終了
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+                print(f"  前回のプロセス (PID {old_pid}) を強制終了しました")
+            except ProcessLookupError:
+                pass
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+
+    _kill_old_process()
+
+    # PIDファイルを書き込む
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+
+    # rclone チェック
     def _check_rclone(rclone_path):
         try:
             r = subprocess.run([rclone_path, "version"], capture_output=True, timeout=5)
@@ -1409,7 +1444,22 @@ def main():
         print("  Settings でパスを正しく設定してください。")
         print("  ダウンロード: https://rclone.org/downloads/")
 
-    server = HTTPServer((HOST, PORT), DeckReelHandler)
+    # ── サーバー起動 (リトライ付き) ──
+    HTTPServer.allow_reuse_address = True
+    server = None
+    for attempt in range(10):
+        try:
+            server = HTTPServer((HOST, PORT), DeckReelHandler)
+            break
+        except OSError as e:
+            if attempt < 9:
+                print(f"  ポート {PORT} がまだ使用中です。リトライ中... ({attempt + 1}/10)")
+                time.sleep(1)
+            else:
+                print(f"  ❌ ポート {PORT} を確保できませんでした: {e}")
+                PID_FILE.unlink(missing_ok=True)
+                return
+
     DeckReelHandler._server_ref = server
     DeckReelHandler.touch_heartbeat()
 
@@ -1419,6 +1469,16 @@ def main():
     print("  Running at {}".format(url))
     print("  Press Ctrl+C to stop")
     print()
+
+    # ── SIGTERM ハンドラ ──
+    def _handle_sigterm(signum, frame):
+        print("\n  SIGTERM received. Shutting down...")
+        # server.shutdown() は serve_forever() の終了を待つため、
+        # シグナルハンドラ（メインスレッド）から直接呼ぶとデッドロックする。
+        # 別スレッドで実行することで回避する。
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     def heartbeat_watchdog():
         while True:
@@ -1432,7 +1492,30 @@ def main():
 
     wd = threading.Thread(target=heartbeat_watchdog, daemon=True)
     wd.start()
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    def launch_browser():
+        import shutil
+        # ゲームモード検出: Steamがゲームとして起動するとこれらの環境変数が設定される
+        game_mode = bool(
+            os.environ.get("SteamGameId")
+            or os.environ.get("GAMESCOPE_WAYLAND_DISPLAY")
+        )
+        if game_mode and shutil.which("flatpak"):
+            try:
+                # --kiosk: ブラウザUIなしの全画面表示 (ゲームモード向け)
+                # --new-window: 既存Firefoxの新タブ化を防ぐ (Gamescopeループ対策)
+                subprocess.Popen(
+                    ["flatpak", "run", "org.mozilla.firefox",
+                     "--kiosk", "--new-window", url],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                return
+            except OSError:
+                pass
+        # デスクトップモードでは通常のブラウザ起動
+        webbrowser.open(url)
+
+    threading.Timer(0.5, launch_browser).start()
 
     try:
         server.serve_forever()
@@ -1441,6 +1524,7 @@ def main():
     finally:
         tracker.close()
         server.server_close()
+        PID_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
