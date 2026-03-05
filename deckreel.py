@@ -65,7 +65,7 @@ class Config:
         "rclone_path": "rclone",
         "drive_remote": "gdrive",
         "drive_base_path": "Screenshots",
-        "transfers": "4",
+        "transfers": "16",
     }
 
     def __init__(self):
@@ -320,7 +320,7 @@ class SyncEngine:
         rclone = self.config.get("rclone_path")
         remote = self.config.get("drive_remote")
         base = self.config.get("drive_base_path")
-        transfers = self.config.get("transfers") or "4"
+        transfers = self.config.get("transfers") or "16"
         done = 0
 
         for (src_dir, safe, game_name), files in groups.items():
@@ -775,16 +775,6 @@ body{display:flex;flex-direction:column;padding-bottom:26px;}
       <input id="cfgBasePath">
       <div class="hint">アップロード先 → リモート名:保存先フォルダ/ゲーム名/</div>
     </div>
-    <div class="field">
-      <label>同時転送数</label>
-      <select id="cfgTransfers">
-        <option value="2">2</option>
-        <option value="4" selected>4</option>
-        <option value="8">8</option>
-        <option value="16">16</option>
-      </select>
-      <div class="hint">rcloneの並列転送数</div>
-    </div>
     <div class="modal-actions">
       <button class="act-btn outline" onclick="closeSettings()">キャンセル</button>
       <button class="act-btn solid"   onclick="saveSettings()">保存</button>
@@ -1044,9 +1034,6 @@ async function openSettings(){
   document.getElementById('cfgRclonePath').value=d.rclone_path||'';
   document.getElementById('cfgRemote').value=d.drive_remote||'';
   document.getElementById('cfgBasePath').value=d.drive_base_path||'';
-  const tSel=document.getElementById('cfgTransfers');
-  const tVal=d.transfers||'4';
-  for(let i=0;i<tSel.options.length;i++){tSel.options[i].selected=(tSel.options[i].value===tVal);}
   const sel=document.getElementById('cfgUserId');sel.innerHTML='';
   for(const uid of(d._user_ids||[])){const o=document.createElement('option');o.value=uid;o.textContent=uid;if(uid===d.steam_user_id)o.selected=true;sel.appendChild(o);}
   if(sel.options.length===0&&d.steam_user_id){const o=document.createElement('option');o.value=d.steam_user_id;o.textContent=d.steam_user_id;o.selected=true;sel.appendChild(o);}
@@ -1060,7 +1047,6 @@ async function saveSettings(){
     rclone_path:document.getElementById('cfgRclonePath').value,
     drive_remote:document.getElementById('cfgRemote').value,
     drive_base_path:document.getElementById('cfgBasePath').value,
-    transfers:document.getElementById('cfgTransfers').value,
   })});
   closeSettings();
   toast('設定を保存しました','success');
