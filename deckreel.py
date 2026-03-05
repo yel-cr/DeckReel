@@ -10,7 +10,7 @@ DeckReel - Steam Deck スクリーンショット マネージャー
 必要環境:
     - Python 3.8+ (SteamOSにプリインストール済み)
     - rclone (Google Driveリモート設定済み)
-    - Webブラウザ (SteamOSにFirefoxがプリインストール済み)
+    - Webブラウザ (Firefox)
 """
 
 import os
