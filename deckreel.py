@@ -731,7 +731,7 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
         </div>
       </div>
       <div class="masthead-actions">
-        <button class="sync-game-btn" onclick="syncSelected()" id="btnSyncSel" title="このゲームをアップロード">&#x2191;</button>
+        <button class="sync-game-btn" onclick="syncSelected()" id="btnSyncSel" title="ゲーム単位でアップロード">&#x2191;</button>
         <button class="sync-game-btn exclude" onclick="toggleExclude()" id="btnExclude" title="一括アップロードから除外">&#xd7;</button>
       </div>
     </div>
