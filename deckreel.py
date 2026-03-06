@@ -27,7 +27,7 @@ import mimetypes
 import webbrowser
 from pathlib import Path
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 
@@ -36,7 +36,7 @@ from urllib.parse import urlparse, parse_qs
 # ═══════════════════════════════════════════════════════════════════
 
 APP_NAME = "DeckReel"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 HOST = "127.0.0.1"
 PORT = 8745
 CONFIG_DIR = Path.home() / ".config" / "deckreel"
@@ -46,7 +46,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_STEAM_PATH = Path.home() / ".local" / "share" / "Steam" / "userdata"
 STEAM_API_URL = "https://store.steampowered.com/api/appdetails?appids={}&l=japanese"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
-HEARTBEAT_TIMEOUT = 10  # seconds without browser heartbeat before auto-shutdown
+HEARTBEAT_TIMEOUT = 30  # seconds without browser heartbeat before auto-shutdown
 PID_FILE = CONFIG_DIR / "deckreel.pid"
 
 # Well-known non-game App IDs
@@ -163,11 +163,12 @@ class GameResolver:
                     data = json.loads(resp.read().decode("utf-8"))
                 if data.get(app_id, {}).get("success"):
                     name = data[app_id]["data"]["name"]
-                else:
-                    name = f"Unknown ({app_id})"
-                self._cache[app_id] = name
-                self._save_cache()
-                return name
+                    self._cache[app_id] = name
+                    self._save_cache()
+                    return name
+                # success:false — レートリミットの可能性があるためキャッシュせず
+                # 次回の Resolve で再取得を試みる
+                return None
             except Exception:
                 if attempt < 2:
                     time.sleep(1.0)
@@ -1263,7 +1264,9 @@ class DeckReelHandler(BaseHTTPRequestHandler):
 
     def _handle_save_config(self):
         body = self._read_json()
-        if body is None:
+        if not isinstance(body, dict):
+            if body is not None:
+                self._error(400, "Bad request")
             return
         for k, v in body.items():
             if k in self._WRITABLE_CONFIG_KEYS:
@@ -1294,7 +1297,7 @@ class DeckReelHandler(BaseHTTPRequestHandler):
                     self.resolver.resolve(aid)
                     with cls._resolve_lock:
                         cls._resolve_status["resolved"] = i + 1
-                    time.sleep(0.35)
+                    time.sleep(0.5)
             except Exception as e:
                 with cls._resolve_lock:
                     cls._resolve_status["error"] = str(e)[:200]
@@ -1338,7 +1341,9 @@ class DeckReelHandler(BaseHTTPRequestHandler):
 
     def _handle_toggle_exclude(self):
         body = self._read_json()
-        if body is None:
+        if not isinstance(body, dict):
+            if body is not None:
+                self._error(400, "Bad request")
             return
         app_id = body.get("app_id", "")
         if not app_id:
@@ -1447,12 +1452,24 @@ def main():
     DeckReelHandler.sync_engine = sync_engine
 
     # ── 前回の残存プロセスを確実に終了する ──
+    def _is_deckreel_process(pid):
+        """PIDリサイクル対策: 対象プロセスがDeckReelかどうかを確認する"""
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace")
+            return "deckreel" in cmdline.lower()
+        except (OSError, IOError):
+            return False
+
     def _kill_old_process():
         if not PID_FILE.exists():
             return
         try:
             old_pid = int(PID_FILE.read_text().strip())
             if old_pid == os.getpid():
+                return
+            # PIDリサイクル対策: 対象がDeckReelプロセスでなければスキップ
+            if not _is_deckreel_process(old_pid):
                 return
             # まず SIGTERM で丁寧に終了を要求
             os.kill(old_pid, signal.SIGTERM)
@@ -1494,11 +1511,12 @@ def main():
         print("  ダウンロード: https://rclone.org/downloads/")
 
     # ── サーバー起動 (リトライ付き) ──
-    HTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
     server = None
     for attempt in range(10):
         try:
-            server = HTTPServer((HOST, PORT), DeckReelHandler)
+            server = ThreadingHTTPServer((HOST, PORT), DeckReelHandler)
             break
         except OSError as e:
             if attempt < 9:
