@@ -154,7 +154,7 @@ class GameResolver:
             self._cache[app_id] = KNOWN_APP_IDS[app_id]
             self._save_cache()
             return self._cache[app_id]
-        # Fix 6: リトライ処理（最大3回、失敗時は1秒待機）
+        # リトライ処理（最大3回、失敗時は1秒待機）
         for attempt in range(3):
             try:
                 url = STEAM_API_URL.format(app_id)
@@ -181,7 +181,6 @@ class GameResolver:
 class SyncTracker:
     def __init__(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        # Fix 7: _lockを先に作成し、CREATE TABLEもロック内で実行する
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
         with self._lock:
@@ -732,7 +731,7 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
         </div>
       </div>
       <div class="masthead-actions">
-        <button class="sync-game-btn" onclick="syncSelected()" id="btnSyncSel" title="ゲーム単位でアップロード">&#x2191;</button>
+        <button class="sync-game-btn" onclick="syncSelected()" id="btnSyncSel" title="このゲームをアップロード">&#x2191;</button>
         <button class="sync-game-btn exclude" onclick="toggleExclude()" id="btnExclude" title="一括アップロードから除外">&#xd7;</button>
       </div>
     </div>
@@ -1163,7 +1162,6 @@ class DeckReelHandler(BaseHTTPRequestHandler):
     _last_heartbeat = 0.0
     _heartbeat_lock = threading.Lock()
     _server_ref = None
-    # Fix 5: Resolve処理の非同期ステータス管理
     _resolve_status = {"running": False, "resolved": 0, "total": 0, "error": ""}
     _resolve_lock = threading.Lock()
 
@@ -1197,7 +1195,6 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         elif path == "/api/sync/status":
             self._json(self.sync_engine.status)
         elif path == "/api/resolve/status":
-            # Fix 5: Resolveの進捗ステータスを返す
             with type(self)._resolve_lock:
                 self._json(dict(type(self)._resolve_status))
             return
@@ -1266,6 +1263,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
 
     def _handle_save_config(self):
         body = self._read_json()
+        if body is None:
+            return
         for k, v in body.items():
             if k in self._WRITABLE_CONFIG_KEYS:
                 self.config.set(k, v)
@@ -1274,7 +1273,7 @@ class DeckReelHandler(BaseHTTPRequestHandler):
 
     def _handle_resolve(self):
         cls = type(self)
-        # Fix 5: すでにResolve中ならスキップ
+        # すでにResolve中ならスキップ
         with cls._resolve_lock:
             if cls._resolve_status["running"]:
                 self._json({"started": False, "already_running": True, "total": cls._resolve_status["total"]})
@@ -1286,7 +1285,7 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         if not unresolved:
             self._json({"resolved": 0})
             return
-        # Fix 5: バックグラウンドスレッドで非同期実行
+        # バックグラウンドスレッドで非同期実行
         with cls._resolve_lock:
             cls._resolve_status = {"running": True, "resolved": 0, "total": len(unresolved), "error": ""}
         def _run():
@@ -1339,6 +1338,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
 
     def _handle_toggle_exclude(self):
         body = self._read_json()
+        if body is None:
+            return
         app_id = body.get("app_id", "")
         if not app_id:
             self._json({"ok": False})
@@ -1347,7 +1348,7 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         self._json({"ok": True, "app_id": app_id, "excluded": excluded})
 
     def _check_image_allowed(self, filepath):
-        """Fix 3: パストラバーサル防止つきのパス検証"""
+        """パストラバーサル防止つきのパス検証"""
         real = os.path.realpath(filepath)
         cls = type(self)
         with cls._games_lock:
@@ -1416,7 +1417,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))
         if length > self._MAX_BODY_SIZE:
-            raise ValueError("Request body too large")
+            self._error(413, "Request body too large")
+            return None
         body = self.rfile.read(length)
         return json.loads(body.decode("utf-8"))
 
