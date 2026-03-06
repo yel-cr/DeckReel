@@ -166,9 +166,11 @@ class GameResolver:
                     self._cache[app_id] = name
                     self._save_cache()
                     return name
-                # success:false — レートリミットの可能性があるためキャッシュせず
-                # 次回の Resolve で再取得を試みる
-                return None
+                # success:false — Steam外ゲームなど名前が取得できない場合
+                fallback = f"unknown({app_id})"
+                self._cache[app_id] = fallback
+                self._save_cache()
+                return fallback
             except Exception:
                 if attempt < 2:
                     time.sleep(1.0)
