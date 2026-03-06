@@ -15,6 +15,7 @@ DeckReel - Steam Deck スクリーンショット マネージャー
 
 import os
 import json
+import copy
 import signal
 import sqlite3
 import subprocess
@@ -22,7 +23,6 @@ import tempfile
 import threading
 import time
 import urllib.request
-import urllib.error
 import mimetypes
 import webbrowser
 from pathlib import Path
@@ -31,13 +31,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 
-
 # ═══════════════════════════════════════════════════════════════════
 #  Constants
 # ═══════════════════════════════════════════════════════════════════
 
 APP_NAME = "DeckReel"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 HOST = "127.0.0.1"
 PORT = 8745
 CONFIG_DIR = Path.home() / ".config" / "deckreel"
@@ -68,11 +67,12 @@ class Config:
         "drive_remote": "gdrive",
         "drive_base_path": "Screenshots",
         "transfers": "16",
+        "excluded_apps": [],
     }
 
     def __init__(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        self._data = dict(self.DEFAULTS)
+        self._data = copy.deepcopy(self.DEFAULTS)
         self.load()
 
     def load(self):
@@ -104,6 +104,20 @@ class Config:
             d.name for d in base.iterdir()
             if d.is_dir() and d.name.isdigit()
         )
+
+    def toggle_exclude(self, app_id):
+        app_id = str(app_id)
+        excluded = self._data.get("excluded_apps", [])
+        if app_id in excluded:
+            excluded.remove(app_id)
+            self._data["excluded_apps"] = excluded
+            self.save()
+            return False  # no longer excluded
+        else:
+            excluded.append(app_id)
+            self._data["excluded_apps"] = excluded
+            self.save()
+            return True  # now excluded
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -158,8 +172,6 @@ class GameResolver:
                 if attempt < 2:
                     time.sleep(1.0)
         return None
-
-
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -250,9 +262,19 @@ class SteamScanner:
             name = self.resolver.get_name(aid) or f"ID: {aid}"
             file_strs = [str(f) for f in files]
             synced = sum(1 for f in files if self.tracker.is_uploaded(f))
+            # 最新スクリーンショットの更新日時を取得（ソート用）
+            latest_mtime = 0.0
+            for f in files:
+                try:
+                    mt = f.stat().st_mtime
+                    if mt > latest_mtime:
+                        latest_mtime = mt
+                except OSError:
+                    pass
             games.append(dict(
                 app_id=aid, name=name, path=str(ss),
                 count=len(files), synced=synced, files=file_strs,
+                latest_mtime=latest_mtime,
             ))
         games.sort(key=lambda g: g["name"].lower())
         return games
@@ -431,8 +453,6 @@ class SyncEngine:
         return to_sync
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════
 #  HTML Frontend (embedded)
 # ═══════════════════════════════════════════════════════════════════
@@ -457,8 +477,6 @@ HTML_PAGE = """<!DOCTYPE html>
 }
 html,body{height:100%;font-family:var(--font-b);background:var(--paper);color:var(--ink);overflow:hidden;-webkit-font-smoothing:antialiased;}
 body{display:flex;flex-direction:column;padding-bottom:30px;}
-/* cursor: default */
-.cursor{display:none!important;}
 
 /* ── TOP BAR ── */
 .topbar{height:64px;flex-shrink:0;border-bottom:2px solid var(--ink);display:flex;align-items:stretch;background:var(--paper);animation:bar-in .5s ease-out both;}
@@ -478,9 +496,13 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
 .exit-btn:hover{background:var(--paper-2);color:var(--ink);}
 .exit-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;}
 .sync-btn{display:flex;align-items:center;gap:10px;padding:0 28px;font-family:var(--font-d);font-size:22px;letter-spacing:2px;color:var(--paper);background:var(--ink);border:none;transition:background .15s;white-space:nowrap;}
-.sync-game-btn{display:flex;align-items:center;gap:10px;padding:0 28px;font-family:var(--font-d);font-size:22px;letter-spacing:2px;color:var(--paper);background:var(--ink-2);border:none;border-left:1px solid rgba(255,255,255,0.1);transition:background .15s;white-space:nowrap;}
-.sync-game-btn:hover{background:var(--ink-3);}
+.sync-game-btn{display:flex;align-items:center;justify-content:center;width:64px;font-family:var(--font-d);font-size:28px;color:var(--paper);background:var(--ink);border:none;border-left:1px solid rgba(255,255,255,0.1);transition:all .15s;flex-shrink:0;}
+.sync-game-btn:hover{background:var(--ink-2);}
 .sync-game-btn:disabled{opacity:0.35;}
+.sync-game-btn.exclude{color:var(--paper);}
+.sync-game-btn.exclude:hover{background:var(--ink-2);}
+.sync-game-btn.excluded{background:#331111;color:#ff6666;border-left-color:rgba(255,68,68,0.15);}
+.sync-game-btn.excluded:hover{background:#441111;}
 .sync-btn:hover{background:var(--ink-2);}
 .sync-btn .arr{transition:transform .2s;}
 .sync-btn:hover .arr{transform:translateY(-2px);}
@@ -514,7 +536,7 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
 .game-item.active .gdot{background:var(--acid);}
 .gdot{width:7px;height:7px;border-radius:50%;background:var(--ink-5);flex-shrink:0;align-self:center;}
 .gdot.done{background:var(--ink);}
-.gdot.partial{background:var(--ink-3);}
+.gdot.excluded{background:var(--paper-3);}
 .game-name{flex:1;font-family:var(--font-b);font-size:16px;font-weight:700;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:.3px;}
 .game-count{font-family:var(--font-m);font-size:14px;color:var(--ink-4);flex-shrink:0;}
 .sidebar-stats{border-top:2px solid var(--ink);display:grid;grid-template-columns:repeat(3,1fr);min-height:76px;flex-shrink:0;}
@@ -530,21 +552,20 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
 /* ── CONTENT ── */
 .content{flex:1;display:flex;flex-direction:column;overflow:hidden;animation:content-in .5s ease-out .16s both;}
 @keyframes content-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.masthead{flex-shrink:0;border-bottom:2px solid var(--ink);padding:10px 0 10px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;background:var(--paper);position:relative;}
+.masthead{flex-shrink:0;border-bottom:2px solid var(--ink);padding:6px 0 6px 32px;display:flex;align-items:center;justify-content:space-between;gap:20px;background:var(--paper);position:relative;}
 .masthead::after{content:'';position:absolute;bottom:-5px;left:0;width:100px;height:3px;background:var(--acid);transition:width .4s ease;}
 .masthead-left{flex:1;min-width:0;overflow:hidden;}
-.masthead-eyebrow{font-family:var(--font-m);font-size:12px;letter-spacing:4px;text-transform:uppercase;color:var(--ink-4);margin-bottom:5px;}
-.masthead-title{font-family:var(--font-d);font-size:clamp(40px,4.5vw,60px);color:var(--ink);line-height:1.1;letter-spacing:1px;overflow:hidden;white-space:nowrap;padding-top:2px;}
+.masthead-eyebrow{font-family:var(--font-m);font-size:11px;letter-spacing:4px;text-transform:uppercase;color:var(--ink-4);margin-bottom:2px;}
+.masthead-title{font-family:var(--font-d);font-size:clamp(32px,3.5vw,46px);color:var(--ink);line-height:1.1;letter-spacing:1px;overflow:hidden;white-space:nowrap;padding-top:1px;}
 .masthead-title .title-inner{display:inline-block;white-space:nowrap;}
 .masthead-title .title-inner.scrolling{animation:title-scroll var(--scroll-dur,8s) linear infinite;}
 @keyframes title-scroll{0%{transform:translateX(0)}40%{transform:translateX(var(--scroll-dist,0px))}60%{transform:translateX(var(--scroll-dist,0px))}100%{transform:translateX(0)}}
 .masthead-meta{display:flex;align-items:center;gap:0;flex-shrink:0;margin-left:auto;}
-.meta-block{text-align:center;padding:0 16px;border-left:1px solid var(--paper-3);}
-.meta-big{font-family:var(--font-d);font-size:clamp(36px,4vw,52px);color:var(--ink);line-height:1;}
+.meta-block{text-align:center;padding:0 14px;border-left:1px solid var(--paper-3);}
+.meta-big{font-family:var(--font-d);font-size:clamp(30px,3.2vw,42px);color:var(--ink);line-height:1;}
 .meta-big.acid{position:relative;}
-.meta-big.acid::after{content:attr(data-n);position:absolute;bottom:0;left:0;background:var(--acid);color:var(--ink);font-size:48px;line-height:1;clip-path:inset(0 100% 0 0);transition:clip-path .5s cubic-bezier(.77,0,.18,1);}
+.meta-big.acid::after{content:attr(data-n);position:absolute;bottom:0;left:0;background:var(--acid);color:var(--ink);font-size:42px;line-height:1;clip-path:inset(0 100% 0 0);transition:clip-path .5s cubic-bezier(.77,0,.18,1);}
 .meta-big.acid.revealed::after{clip-path:inset(0 0% 0 0);}
-.meta-label{display:none;}
 .masthead-actions{display:flex;gap:0;align-items:stretch;flex-shrink:0;align-self:stretch;}
 .act-btn{font-family:var(--font-m);font-size:13px;letter-spacing:2px;text-transform:uppercase;padding:8px 18px;border:1.5px solid;transition:all .15s;}
 .act-btn.outline{color:var(--ink-3);border-color:var(--paper-3);background:transparent;}
@@ -580,10 +601,6 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
 .game-list.dragging{cursor:grabbing;scroll-behavior:auto;user-select:none;}
 .grid-header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:16px;}
 .grid-header-label{font-family:var(--font-m);font-size:13px;letter-spacing:3px;text-transform:uppercase;color:var(--ink-4);}
-.grid-header-sort{font-family:var(--font-m);font-size:12px;letter-spacing:1px;color:var(--ink-4);display:flex;gap:12px;}
-.sort-opt{transition:color .15s;padding-bottom:1px;}
-.sort-opt:hover{color:var(--ink);}
-.sort-opt.active{color:var(--ink);border-bottom:1.5px solid var(--ink);}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:3px;}
 .thumb-card{position:relative;overflow:hidden;background:var(--paper-3);animation:card-in .4s ease-out both;}
 @keyframes card-in{from{opacity:0}to{opacity:1}}
@@ -646,7 +663,6 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
 </head>
 <body>
 
-<div class="cursor" id="cursor"></div>
 <div class="toast-wrap" id="toasts"></div>
 
 <!-- ── TOP BAR ── -->
@@ -688,9 +704,9 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
       </div>
     </div>
     <div class="filter-row">
-      <button class="fpill active" data-filter="all"  onclick="setFilter('all')">All</button>
-      <button class="fpill"        data-filter="done" onclick="setFilter('done')">Done</button>
-      <button class="fpill"        data-filter="none" onclick="setFilter('none')">Pending</button>
+      <button class="fpill active" data-sort="name"  onclick="setSort('name')">Name</button>
+      <button class="fpill"        data-sort="date"  onclick="setSort('date')">Date</button>
+      <button class="fpill"        data-sort="count" onclick="setSort('count')">Count</button>
     </div>
     <div class="game-list" id="gameList"></div>
     <div class="sidebar-stats">
@@ -710,15 +726,14 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
       <div class="masthead-meta">
         <div class="meta-block">
           <div class="meta-big" id="metaTotal">0</div>
-          <div class="meta-label">Total</div>
         </div>
         <div class="meta-block">
           <div class="meta-big acid" id="metaSynced" data-n="0">0</div>
-          <div class="meta-label">Synced</div>
         </div>
       </div>
       <div class="masthead-actions">
-        <button class="sync-game-btn" onclick="syncSelected()" id="btnSyncSel">&#x2191; SYNC GAME</button>
+        <button class="sync-game-btn" onclick="syncSelected()" id="btnSyncSel" title="ゲーム単位でアップロード">&#x2191;</button>
+        <button class="sync-game-btn exclude" onclick="toggleExclude()" id="btnExclude" title="一括アップロードから除外">&#xd7;</button>
       </div>
     </div>
 
@@ -812,12 +827,10 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
 <div class="ticker"><div class="ticker-inner" id="tickerInner"></div></div>
 
 <script>
-let games=[], selectedAppId=null, viewerFiles=[], viewerIdx=0, uploadedSet=new Set(), appVersion='---';
-let curFilter='all';
+let games=[], selectedAppId=null, viewerFiles=[], viewerIdx=0, uploadedSet=new Set(), excludedSet=new Set(), appVersion='---';
+let curSort='name';
 const API=(p,o)=>fetch('/api'+p,o).then(r=>r.json());
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-
-// cursor: default (removed custom cursor)
 
 // ── Toast ──
 function toast(msg,type='info'){
@@ -830,18 +843,18 @@ function toast(msg,type='info'){
 }
 
 // ── Filter / Sort ──
-function setFilter(f){
-  curFilter=f;
-  document.querySelectorAll('.fpill').forEach(p=>p.classList.toggle('active',p.dataset.filter===f));
+function setSort(s){
+  curSort=s;
+  document.querySelectorAll('.fpill').forEach(p=>p.classList.toggle('active',p.dataset.sort===s));
   renderGameList();
 }
 function getSortedFiltered(){
   const ft=document.getElementById('searchInput').value.toLowerCase();
   let list=[...games];
   if(ft) list=list.filter(g=>g.name.toLowerCase().includes(ft));
-  if(curFilter==='done')    list=list.filter(g=>g.synced===g.count);
-  else if(curFilter==='none')    list=list.filter(g=>g.synced<g.count);  // PARTIALも含む
-  list.sort((a,b)=>a.name.localeCompare(b.name,'ja'));
+  if(curSort==='name') list.sort((a,b)=>a.name.localeCompare(b.name,'ja'));
+  else if(curSort==='date') list.sort((a,b)=>(b.latest_mtime||0)-(a.latest_mtime||0));
+  else if(curSort==='count') list.sort((a,b)=>b.count-a.count);
   return list;
 }
 
@@ -853,6 +866,7 @@ async function doRefresh(){
     games=d.games||[];
     appVersion=d.version||'---';
     uploadedSet=new Set(d.uploaded_paths||[]);
+    excludedSet=new Set(d.excluded_apps||[]);
     renderGameList();
     updateStats();
     updateTicker();
@@ -867,7 +881,8 @@ function filterGames(){renderGameList();}
 function renderGameList(){
   const el=document.getElementById('gameList');el.innerHTML='';
   for(const g of getSortedFiltered()){
-    const dot=g.synced===g.count?'done':'none';  // partialはnoneに統合
+    const isExcluded=excludedSet.has(g.app_id);
+    const dot=isExcluded?'excluded':(g.synced===g.count?'done':'none');
     const div=document.createElement('div');
     div.className='game-item'+(g.app_id===selectedAppId?' active':'');
     div.innerHTML=`<div class="gdot ${dot}"></div><div class="game-name">${esc(g.name.toUpperCase())}</div><div class="game-count">${g.synced}/${g.count}</div>`;
@@ -918,14 +933,6 @@ function showGame(g){
   ms.classList.remove('revealed');
   requestAnimationFrame(()=>requestAnimationFrame(()=>ms.classList.add('revealed')));
 
-  // acid underline width = ratio
-  const pct=g.count>0?Math.round(g.synced/g.count*100):0;
-  document.querySelector('.masthead').style.setProperty('--uw',(40+pct*0.6)+'px');
-  document.querySelector('.masthead::after');
-  // just set via style attribute trick
-  const mh=document.getElementById('masthead');
-  mh.style.setProperty('--acid-w',(40+pct*0.6)+'px');
-
   document.getElementById('welcomePanel').style.display='none';
   const area=document.getElementById('gridArea');
   let old=area.querySelector('.grid-wrap');if(old)old.remove();
@@ -948,6 +955,7 @@ function showGame(g){
     card.onclick=()=>openViewer(i);
     grid.appendChild(card);
   });
+  updateExcludeBtn();
 }
 
 // ── Viewer ──
@@ -993,6 +1001,24 @@ async function pollResolve(){
 // ── Sync ──
 async function syncAll(){startSync('/sync/all');}
 async function syncSelected(){if(!selectedAppId)return;startSync('/sync/game?app_id='+selectedAppId);}
+async function toggleExclude(){
+  if(!selectedAppId)return;
+  try{
+    const d=await API('/exclude',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app_id:selectedAppId})});
+    if(d.excluded){excludedSet.add(selectedAppId);toast('一括アップロードから除外しました','info');}
+    else{excludedSet.delete(selectedAppId);toast('除外を解除しました','success');}
+    updateExcludeBtn();
+    renderGameList();
+    updateStats();
+  }catch(e){toast('除外設定に失敗: '+e.message,'error');}
+}
+function updateExcludeBtn(){
+  const btn=document.getElementById('btnExclude');
+  if(!selectedAppId)return;
+  const isExcluded=excludedSet.has(selectedAppId);
+  btn.classList.toggle('excluded',isExcluded);
+  btn.title=isExcluded?'除外を解除':'一括アップロードから除外';
+}
 async function startSync(ep){
   try{
     const d=await API(ep,{method:'POST'});
@@ -1198,6 +1224,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         elif path == "/api/sync/cancel":
             self.sync_engine.cancel()
             self._json({"ok": True})
+        elif path == "/api/exclude":
+            self._handle_toggle_exclude()
         elif path == "/api/exit":
             self._handle_exit()
         else:
@@ -1224,17 +1252,22 @@ class DeckReelHandler(BaseHTTPRequestHandler):
             for fp in g["files"]:
                 if self.tracker.is_uploaded(fp):
                     uploaded.append(fp)
-        self._json({"games": new_games, "uploaded_paths": uploaded, "version": APP_VERSION})
+        self._json({"games": new_games, "uploaded_paths": uploaded, "version": APP_VERSION, "excluded_apps": self.config.get("excluded_apps") or []})
 
     def _handle_get_config(self):
         data = self.config.as_dict()
         data["_user_ids"] = self.config.detect_user_ids()
         self._json(data)
 
+    _WRITABLE_CONFIG_KEYS = {
+        "steam_userdata_path", "steam_user_id",
+        "rclone_path", "drive_remote", "drive_base_path",
+    }
+
     def _handle_save_config(self):
         body = self._read_json()
         for k, v in body.items():
-            if not k.startswith("_"):
+            if k in self._WRITABLE_CONFIG_KEYS:
                 self.config.set(k, v)
         self.config.save()
         self._json({"ok": True})
@@ -1277,7 +1310,8 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         with cls._games_lock:
             if not cls._games:
                 cls._games = self.scanner.scan()
-            games_snapshot = list(cls._games)
+            excluded = self.config.get("excluded_apps") or []
+            games_snapshot = [g for g in cls._games if g["app_id"] not in excluded]
         files = self.sync_engine.collect_files(games_snapshot)
         if not files:
             self._json({"count": 0})
@@ -1302,6 +1336,15 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         t = threading.Thread(target=self.sync_engine.sync, args=(files,), daemon=True)
         t.start()
         self._json({"count": len(files)})
+
+    def _handle_toggle_exclude(self):
+        body = self._read_json()
+        app_id = body.get("app_id", "")
+        if not app_id:
+            self._json({"ok": False})
+            return
+        excluded = self.config.toggle_exclude(app_id)
+        self._json({"ok": True, "app_id": app_id, "excluded": excluded})
 
     def _check_image_allowed(self, filepath):
         """Fix 3: パストラバーサル防止つきのパス検証"""
@@ -1368,8 +1411,12 @@ class DeckReelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(msg.encode())
 
+    _MAX_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))
+        if length > self._MAX_BODY_SIZE:
+            raise ValueError("Request body too large")
         body = self.rfile.read(length)
         return json.loads(body.decode("utf-8"))
 
