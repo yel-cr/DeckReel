@@ -16,6 +16,9 @@ DeckReel - Steam Deck スクリーンショット マネージャー
 import os
 import json
 import copy
+import re
+import struct
+import zlib
 import signal
 import sqlite3
 import subprocess
@@ -36,7 +39,7 @@ from urllib.parse import urlparse, parse_qs
 # ═══════════════════════════════════════════════════════════════════
 
 APP_NAME = "DeckReel"
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.8.0"
 HOST = "127.0.0.1"
 PORT = 8745
 CONFIG_DIR = Path.home() / ".config" / "deckreel"
@@ -125,16 +128,36 @@ class Config:
 # ═══════════════════════════════════════════════════════════════════
 
 class GameResolver:
-    def __init__(self):
+
+
+    _PLACEHOLDER_RE = re.compile(r"^(?:ID:\s*|unknown\()", re.IGNORECASE)
+
+    def __init__(self, config=None):
+        self.config = config
         self._cache = {}
+        self._local_names = {}
+        self._local_lock = threading.Lock()
+        self._last_local_scan = 0.0
         self._load_cache()
+
+    @classmethod
+    def is_placeholder(cls, name):
+        return not name or bool(cls._PLACEHOLDER_RE.match(str(name)))
 
     def _load_cache(self):
         if CACHE_FILE.exists():
             try:
                 with open(CACHE_FILE, "r") as f:
-                    self._cache = json.load(f)
-            except (json.JSONDecodeError, IOError):
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    cleaned = {
+                        str(k): str(v) for k, v in loaded.items()
+                        if isinstance(v, str) and not self.is_placeholder(v)
+                    }
+                    self._cache = cleaned
+                    if len(cleaned) != len(loaded):
+                        self._save_cache()
+            except (json.JSONDecodeError, IOError, TypeError, ValueError):
                 self._cache = {}
 
     def _save_cache(self):
@@ -142,35 +165,292 @@ class GameResolver:
         with open(CACHE_FILE, "w") as f:
             json.dump(self._cache, f, indent=2, ensure_ascii=False)
 
+    @staticmethod
+    def _unescape_vdf(value):
+        return value.replace(r'\"', '"').replace(r'\\', '\\')
+
+    @classmethod
+    def _parse_text_vdf(cls, text):
+        token_re = re.compile(r'"((?:\\.|[^"\\])*)"|([{}])')
+        tokens = []
+        for match in token_re.finditer(text):
+            if match.group(2):
+                tokens.append(match.group(2))
+            else:
+                tokens.append(cls._unescape_vdf(match.group(1)))
+
+        def parse_object(pos, stop_at_brace=False):
+            result = {}
+            while pos < len(tokens):
+                token = tokens[pos]
+                if token == "}":
+                    return result, pos + 1
+                if token == "{":
+                    pos += 1
+                    continue
+                key = token
+                pos += 1
+                if pos >= len(tokens):
+                    result[key] = ""
+                    break
+                if tokens[pos] == "{":
+                    value, pos = parse_object(pos + 1, True)
+                else:
+                    value = tokens[pos]
+                    pos += 1
+                result[key] = value
+            return result, pos
+
+        parsed, _ = parse_object(0)
+        return parsed
+
+    @classmethod
+    def _read_text_vdf(cls, path):
+        try:
+            raw = Path(path).read_bytes()
+        except OSError:
+            return {}
+        for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+            try:
+                return cls._parse_text_vdf(raw.decode(encoding))
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _read_cstring(data, pos):
+        end = data.find(b"\x00", pos)
+        if end < 0:
+            raise ValueError("unterminated binary VDF string")
+        value = data[pos:end].decode("utf-8", errors="replace")
+        return value, end + 1
+
+    @classmethod
+    def _parse_binary_vdf(cls, data):
+        def parse_object(pos):
+            result = {}
+            while pos < len(data):
+                value_type = data[pos]
+                pos += 1
+                if value_type == 0x08:  # end of object
+                    return result, pos
+
+                key, pos = cls._read_cstring(data, pos)
+                if value_type == 0x00:  # nested object
+                    value, pos = parse_object(pos)
+                elif value_type == 0x01:  # string
+                    value, pos = cls._read_cstring(data, pos)
+                elif value_type == 0x02:  # int32
+                    if pos + 4 > len(data):
+                        raise ValueError("truncated int32")
+                    value = struct.unpack_from("<i", data, pos)[0]
+                    pos += 4
+                elif value_type == 0x03:  # float32
+                    if pos + 4 > len(data):
+                        raise ValueError("truncated float32")
+                    value = struct.unpack_from("<f", data, pos)[0]
+                    pos += 4
+                elif value_type in (0x04, 0x06):  # pointer / color
+                    if pos + 4 > len(data):
+                        raise ValueError("truncated 4-byte value")
+                    value = data[pos:pos + 4]
+                    pos += 4
+                elif value_type == 0x05:  # UTF-16 string
+                    if pos + 2 > len(data):
+                        raise ValueError("truncated wide string length")
+                    char_count = struct.unpack_from("<H", data, pos)[0]
+                    pos += 2
+                    byte_count = char_count * 2
+                    if pos + byte_count > len(data):
+                        raise ValueError("truncated wide string")
+                    value = data[pos:pos + byte_count].decode("utf-16-le", errors="replace").rstrip("\x00")
+                    pos += byte_count
+                elif value_type == 0x07:  # uint64
+                    if pos + 8 > len(data):
+                        raise ValueError("truncated uint64")
+                    value = struct.unpack_from("<Q", data, pos)[0]
+                    pos += 8
+                elif value_type == 0x0A:  # int64 (newer KeyValues variants)
+                    if pos + 8 > len(data):
+                        raise ValueError("truncated int64")
+                    value = struct.unpack_from("<q", data, pos)[0]
+                    pos += 8
+                else:
+                    raise ValueError(f"unsupported binary VDF type: {value_type}")
+                result[key] = value
+            return result, pos
+
+        parsed, _ = parse_object(0)
+        return parsed
+
+    def _steam_root(self):
+        if not self.config:
+            return None
+        userdata = Path(self.config.get("steam_userdata_path")).expanduser()
+        return userdata.parent
+
+    def _library_paths(self):
+        steam_root = self._steam_root()
+        if not steam_root:
+            return []
+
+        paths = [steam_root]
+        library_file = steam_root / "steamapps" / "libraryfolders.vdf"
+        parsed = self._read_text_vdf(library_file)
+        folders = parsed.get("libraryfolders", parsed)
+        if isinstance(folders, dict):
+            for entry in folders.values():
+                if isinstance(entry, dict) and entry.get("path"):
+                    paths.append(Path(entry["path"]).expanduser())
+
+        if library_file.exists() and len(paths) == 1:
+            try:
+                text = library_file.read_text(encoding="utf-8", errors="replace")
+                for raw_path in re.findall(r'"path"\s*"([^"]+)"', text, flags=re.IGNORECASE):
+                    paths.append(Path(self._unescape_vdf(raw_path)).expanduser())
+            except OSError:
+                pass
+
+        unique = []
+        seen = set()
+        for path in paths:
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+        return unique
+
+    def _load_manifest_names(self):
+        names = {}
+        for library in self._library_paths():
+            steamapps = library / "steamapps"
+            if not steamapps.is_dir():
+                continue
+            try:
+                manifests = steamapps.glob("appmanifest_*.acf")
+                for manifest in manifests:
+                    parsed = self._read_text_vdf(manifest)
+                    state = parsed.get("AppState", parsed)
+                    if not isinstance(state, dict):
+                        continue
+                    app_id = str(state.get("appid") or manifest.stem[len("appmanifest_"):])
+                    name = state.get("name")
+                    if app_id.isdigit() and isinstance(name, str) and name.strip():
+                        names[app_id] = name.strip()
+            except OSError:
+                continue
+        return names
+
+    def _load_shortcut_names(self):
+        names = {}
+        if not self.config:
+            return names
+        uid = str(self.config.get("steam_user_id") or "")
+        if not uid:
+            return names
+        shortcuts_file = (
+            Path(self.config.get("steam_userdata_path")).expanduser()
+            / uid / "config" / "shortcuts.vdf"
+        )
+        try:
+            parsed = self._parse_binary_vdf(shortcuts_file.read_bytes())
+        except (OSError, ValueError, struct.error):
+            return names
+
+        shortcuts = parsed.get("shortcuts", parsed)
+        if not isinstance(shortcuts, dict):
+            return names
+
+        for entry in shortcuts.values():
+            if not isinstance(entry, dict):
+                continue
+            app_name = entry.get("appname")
+            if not isinstance(app_name, str) or not app_name.strip():
+                continue
+            app_name = app_name.strip()
+
+            for key in ("appid", "AppID", "gameid", "GameID"):
+                value = entry.get(key)
+                if isinstance(value, int):
+                    unsigned = value & 0xFFFFFFFF
+                    names[str(unsigned)] = app_name
+                    if value >= 0:
+                        names[str(value)] = app_name
+
+            exe = entry.get("exe")
+            if isinstance(exe, str):
+                generated = zlib.crc32((exe + app_name).encode("utf-8")) | 0x80000000
+                names.setdefault(str(generated), app_name)
+        return names
+
+    def refresh_local_names(self, force=False):
+        now = time.monotonic()
+        with self._local_lock:
+            if not force and self._local_names and now - self._last_local_scan < 10:
+                return dict(self._local_names)
+            names = self._load_manifest_names()
+            names.update(self._load_shortcut_names())
+            names.update(KNOWN_APP_IDS)
+            self._local_names = names
+            self._last_local_scan = now
+
+            changed = False
+            for app_id, name in names.items():
+                if name and self._cache.get(app_id) != name:
+                    self._cache[app_id] = name
+                    changed = True
+            if changed:
+                self._save_cache()
+            return dict(self._local_names)
+
+    def invalidate_local_names(self):
+        with self._local_lock:
+            self._local_names = {}
+            self._last_local_scan = 0.0
+
     def get_name(self, app_id):
-        return self._cache.get(str(app_id))
+        app_id = str(app_id)
+        local = self._local_names.get(app_id)
+        if local:
+            return local
+        cached = self._cache.get(app_id)
+        return cached if not self.is_placeholder(cached) else None
 
     def resolve(self, app_id):
         app_id = str(app_id)
-        if app_id in self._cache:
-            return self._cache[app_id]
-        # Check well-known non-game IDs first
+
+        local = self._local_names.get(app_id)
+        if local:
+            return local
         if app_id in KNOWN_APP_IDS:
-            self._cache[app_id] = KNOWN_APP_IDS[app_id]
-            self._save_cache()
-            return self._cache[app_id]
-        # リトライ処理（最大3回、失敗時は1秒待機）
+            return KNOWN_APP_IDS[app_id]
+
+        cached = self._cache.get(app_id)
+        if cached and not self.is_placeholder(cached):
+            return cached
+
         for attempt in range(3):
             try:
                 url = STEAM_API_URL.format(app_id)
-                req = urllib.request.Request(url, headers={"User-Agent": f"DeckReel/{APP_VERSION}"})
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": f"DeckReel/{APP_VERSION}",
+                        "Accept": "application/json",
+                    },
+                )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                if data.get(app_id, {}).get("success"):
-                    name = data[app_id]["data"]["name"]
-                    self._cache[app_id] = name
+                item = data.get(app_id, {}) if isinstance(data, dict) else {}
+                details = item.get("data", {}) if isinstance(item, dict) else {}
+                name = details.get("name") if item.get("success") else None
+                if isinstance(name, str) and name.strip():
+                    self._cache[app_id] = name.strip()
                     self._save_cache()
-                    return name
-                # success:false — Steam外ゲームなど名前が取得できない場合
-                fallback = f"unknown({app_id})"
-                self._cache[app_id] = fallback
-                self._save_cache()
-                return fallback
+                    return name.strip()
+                return None
             except Exception:
                 if attempt < 2:
                     time.sleep(1.0)
@@ -244,6 +524,8 @@ class SteamScanner:
         return Path(self.config.get("steam_userdata_path")) / uid / "760" / "remote"
 
     def scan(self):
+        # Steamクライアントのローカル情報を先に更新してから一覧を作る。
+        self.resolver.refresh_local_names()
         base = self.screenshot_base()
         if not base or not base.exists():
             return []
@@ -282,7 +564,7 @@ class SteamScanner:
         return games
 
     def unresolved_ids(self, games):
-        return [g["app_id"] for g in games if g["name"].startswith("ID: ")]
+        return [g["app_id"] for g in games if self.resolver.is_placeholder(g.get("name"))]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -754,7 +1036,7 @@ body{display:flex;flex-direction:column;padding-bottom:30px;}
         <div class="welcome-steps">
           <div class="w-step"><span class="w-step-n">01</span><span>Open <strong>Settings</strong> to configure</span></div>
           <div class="w-step"><span class="w-step-n">02</span><span>Click <strong>Scan</strong> to discover screenshots</span></div>
-          <div class="w-step"><span class="w-step-n">03</span><span>Click <strong>Resolve</strong> to fetch game names</span></div>
+          <div class="w-step"><span class="w-step-n">03</span><span>Game names are read from Steam automatically; <strong>Resolve</strong> retries missing names</span></div>
           <div class="w-step"><span class="w-step-n">04</span><span>Click <strong>Sync All</strong> to upload</span></div>
         </div>
       </div>
@@ -1270,10 +1552,15 @@ class DeckReelHandler(BaseHTTPRequestHandler):
             if body is not None:
                 self._error(400, "Bad request")
             return
+        steam_source_changed = False
         for k, v in body.items():
             if k in self._WRITABLE_CONFIG_KEYS:
+                if k in {"steam_userdata_path", "steam_user_id"} and self.config.get(k) != v:
+                    steam_source_changed = True
                 self.config.set(k, v)
         self.config.save()
+        if steam_source_changed:
+            self.resolver.invalidate_local_names()
         self._json({"ok": True})
 
     def _handle_resolve(self):
@@ -1283,9 +1570,10 @@ class DeckReelHandler(BaseHTTPRequestHandler):
             if cls._resolve_status["running"]:
                 self._json({"started": False, "already_running": True, "total": cls._resolve_status["total"]})
                 return
+        # Resolveボタンはローカル情報の強制再読込も兼ねる。
+        self.resolver.refresh_local_names(force=True)
         with cls._games_lock:
-            if not cls._games:
-                cls._games = self.scanner.scan()
+            cls._games = self.scanner.scan()
             unresolved = self.scanner.unresolved_ids(cls._games)
         if not unresolved:
             self._json({"resolved": 0})
@@ -1436,7 +1724,7 @@ class DeckReelHandler(BaseHTTPRequestHandler):
 
 def main():
     config = Config()
-    resolver = GameResolver()
+    resolver = GameResolver(config)
     tracker = SyncTracker()
     scanner = SteamScanner(config, resolver, tracker)
     sync_engine = SyncEngine(config, tracker, resolver)
