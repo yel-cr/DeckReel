@@ -135,8 +135,10 @@ class GameResolver:
     def __init__(self, config=None):
         self.config = config
         self._cache = {}
+        self._localized_ids = set()
         self._local_names = {}
-        self._local_lock = threading.Lock()
+        self._priority_names = dict(KNOWN_APP_IDS)
+        self._local_lock = threading.RLock()
         self._last_local_scan = 0.0
         self._load_cache()
 
@@ -147,23 +149,48 @@ class GameResolver:
     def _load_cache(self):
         if CACHE_FILE.exists():
             try:
-                with open(CACHE_FILE, "r") as f:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 if isinstance(loaded, dict):
-                    cleaned = {
-                        str(k): str(v) for k, v in loaded.items()
-                        if isinstance(v, str) and not self.is_placeholder(v)
-                    }
-                    self._cache = cleaned
-                    if len(cleaned) != len(loaded):
-                        self._save_cache()
+                    # v1 の文字列キャッシュは表示用に残し、日本語指定で再取得する。
+                    versioned = loaded.get("version") == 2
+                    entries = loaded.get("names", {}) if versioned else loaded
+                    if not isinstance(entries, dict):
+                        return
+                    for app_id, entry in entries.items():
+                        name = entry.get("name") if isinstance(entry, dict) and versioned else entry
+                        if not isinstance(name, str) or self.is_placeholder(name.strip()):
+                            continue
+                        app_id = str(app_id)
+                        self._cache[app_id] = name.strip()
+                        if versioned and isinstance(entry, dict) and entry.get("language") == "japanese":
+                            self._localized_ids.add(app_id)
             except (json.JSONDecodeError, IOError, TypeError, ValueError):
                 self._cache = {}
+                self._localized_ids = set()
 
     def _save_cache(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CACHE_FILE, "w") as f:
-            json.dump(self._cache, f, indent=2, ensure_ascii=False)
+        with self._local_lock:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {"version": 2, "names": {
+                app_id: {
+                    "name": name,
+                    "language": "japanese" if app_id in self._localized_ids else None,
+                }
+                for app_id, name in self._cache.items()
+            }}
+            # スキャンと Resolve が重なっても、途中の JSON を残さない。
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=CONFIG_DIR, delete=False,
+                ) as f:
+                    temp_path = f.name
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                os.replace(temp_path, CACHE_FILE)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.unlink(temp_path)
 
     @staticmethod
     def _unescape_vdf(value):
@@ -391,14 +418,18 @@ class GameResolver:
             if not force and self._local_names and now - self._last_local_scan < 10:
                 return dict(self._local_names)
             names = self._load_manifest_names()
-            names.update(self._load_shortcut_names())
-            names.update(KNOWN_APP_IDS)
+            self._priority_names = self._load_shortcut_names()
+            self._priority_names.update(KNOWN_APP_IDS)
+            names.update(self._priority_names)
             self._local_names = names
             self._last_local_scan = now
 
             changed = False
             for app_id, name in names.items():
-                if name and self._cache.get(app_id) != name:
+                # 日本語指定で取得済みの名前を manifest の標準名で上書きしない。
+                # ショートカット名はユーザーごとなので共有キャッシュには保存しない。
+                if (app_id not in self._priority_names and app_id not in self._localized_ids
+                        and name and self._cache.get(app_id) != name):
                     self._cache[app_id] = name
                     changed = True
             if changed:
@@ -408,28 +439,32 @@ class GameResolver:
     def invalidate_local_names(self):
         with self._local_lock:
             self._local_names = {}
+            self._priority_names = dict(KNOWN_APP_IDS)
             self._last_local_scan = 0.0
 
     def get_name(self, app_id):
         app_id = str(app_id)
-        local = self._local_names.get(app_id)
-        if local:
-            return local
-        cached = self._cache.get(app_id)
-        return cached if not self.is_placeholder(cached) else None
+        with self._local_lock:
+            if app_id in self._priority_names:
+                return self._priority_names[app_id]
+            if app_id in self._localized_ids:
+                return self._cache[app_id]
+            name = self._local_names.get(app_id) or self._cache.get(app_id)
+            return name if not self.is_placeholder(name) else None
+
+    def needs_resolution(self, app_id):
+        app_id = str(app_id)
+        with self._local_lock:
+            # 非Steamゲームの ID はストア API で照会できない。
+            return (app_id.isascii() and app_id.isdigit() and 0 < int(app_id) < 0x80000000
+                    and app_id not in self._priority_names
+                    and app_id not in self._localized_ids)
 
     def resolve(self, app_id):
         app_id = str(app_id)
 
-        local = self._local_names.get(app_id)
-        if local:
-            return local
-        if app_id in KNOWN_APP_IDS:
-            return KNOWN_APP_IDS[app_id]
-
-        cached = self._cache.get(app_id)
-        if cached and not self.is_placeholder(cached):
-            return cached
+        if not self.needs_resolution(app_id):
+            return self.get_name(app_id)
 
         for attempt in range(3):
             try:
@@ -439,22 +474,25 @@ class GameResolver:
                     headers={
                         "User-Agent": f"DeckReel/{APP_VERSION}",
                         "Accept": "application/json",
+                        "Accept-Language": "ja,en;q=0.8",
                     },
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 item = data.get(app_id, {}) if isinstance(data, dict) else {}
-                details = item.get("data", {}) if isinstance(item, dict) else {}
-                name = details.get("name") if item.get("success") else None
-                if isinstance(name, str) and name.strip():
-                    self._cache[app_id] = name.strip()
-                    self._save_cache()
+                details = item.get("data") if isinstance(item, dict) and item.get("success") else None
+                name = details.get("name") if isinstance(details, dict) else None
+                if isinstance(name, str) and not self.is_placeholder(name.strip()):
+                    with self._local_lock:
+                        self._cache[app_id] = name.strip()
+                        self._localized_ids.add(app_id)
+                        self._save_cache()
                     return name.strip()
-                return None
+                return self.get_name(app_id)
             except Exception:
                 if attempt < 2:
                     time.sleep(1.0)
-        return None
+        return self.get_name(app_id)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -564,7 +602,7 @@ class SteamScanner:
         return games
 
     def unresolved_ids(self, games):
-        return [g["app_id"] for g in games if self.resolver.is_placeholder(g.get("name"))]
+        return [g["app_id"] for g in games if self.resolver.needs_resolution(g["app_id"])]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -726,11 +764,7 @@ class SyncEngine:
     def collect_files(self, games):
         to_sync = []
         for g in games:
-            name = g["name"]
-            if name.startswith("ID: "):
-                resolved = self.resolver.get_name(g["app_id"])
-                if resolved:
-                    name = resolved
+            name = self.resolver.get_name(g["app_id"]) or g["name"]
             for fp in g["files"]:
                 if not self.tracker.is_uploaded(fp):
                     to_sync.append((fp, name))
